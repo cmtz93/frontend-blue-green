@@ -1,0 +1,140 @@
+name: 🚀 Production Release Deploy
+
+on:
+  release:
+    types: [published]
+  # push:
+  #  branches: [main]
+  # workflow_dispatch: # Permite ejecutar manualmente para pruebas
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: ${{ secrets.S3_BUCKET_NAME }}
+  CF_DIST_ID: ${{ secrets.CF_DISTRIBUTION_ID }}
+  SSM_PARAM_NAME: ${{ secrets.SSM_PARAMETER_NAME }}
+  IAM_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+  RELEASE_VERSION: ${{ github.event.release.tag_name }}
+
+jobs:
+  deploy-blue-green:
+    name: "Deploy ${{ github.event.release.tag_name }}"
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Setup
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          # Importante: Hacemos checkout del TAG de la release, no de main
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 2. Build y Checksum
+      - name: Build Release Artifact
+        id: build
+        run: |
+          echo "🏗️ Construyendo versión: $RELEASE_VERSION"
+          npm ci
+          npm run build
+          
+          # Generar hash para integridad
+          find dist/ -type f -exec sha256sum {} + | sort | sha256sum > artifact.sha256
+          echo "Checksum calculado."
+
+      # 3. Determinar Entorno (Blue vs Green)
+      - name: Determine Target Environment
+        id: target_env
+        run: |
+          CURRENT_ENV=$(aws ssm get-parameter --name "${{ env.SSM_PARAM_NAME }}" --query "Parameter.Value" --output text || echo "blue")
+          
+          if [ "$CURRENT_ENV" == "blue" ]; then
+            echo "TARGET_ENV=green" >> $GITHUB_OUTPUT
+            echo "CURRENT_ENV=blue" >> $GITHUB_OUTPUT
+          else
+            echo "TARGET_ENV=blue" >> $GITHUB_OUTPUT
+            echo "CURRENT_ENV=green" >> $GITHUB_OUTPUT
+          fi
+
+      # 4. Subida Atómica a Blue/Green
+      - name: Atomic Upload to S3 (Blue/Green)
+        env:
+          TARGET: ${{ steps.target_env.outputs.TARGET_ENV }}
+        run: |
+          # ... (código existente para sync a /temp-deploy y luego a /$TARGET) ...
+
+      # 4.bis. Opcional: Guardar el artefacto de la Release en su propia carpeta inmutable
+      - name: Archive Release Artifact to S3 by Tag
+        if: success() # Solo si el despliegue Blue/Green fue exitoso
+        env:
+          TARGET: ${{ steps.target_env.outputs.TARGET_ENV }}
+        run: |
+          echo "Archivando versión $RELEASE_VERSION en s3://${{ env.S3_BUCKET }}/releases/$RELEASE_VERSION/"
+          aws s3 sync ./dist s3://${{ env.S3_BUCKET }}/releases/$RELEASE_VERSION/ --delete
+          echo "✅ Versión $RELEASE_VERSION archivada."
+
+      # 5. Smoke Test
+      - name: Smoke Test
+        id: smoke
+        env:
+          TARGET: ${{ steps.target_env.outputs.TARGET_ENV }}
+        run: |
+          aws s3api head-object --bucket ${{ env.S3_BUCKET }} --key $TARGET/index.html
+          echo "✅ Smoke Test Passed for version $RELEASE_VERSION"
+
+      # 6. Conmutación de Tráfico (Swap)
+      - name: Swap CloudFront Origin Path
+        if: success()
+        env:
+          TARGET: ${{ steps.target_env.outputs.TARGET_ENV }}
+        run: |
+          aws cloudfront get-distribution-config --id ${{ env.CF_DIST_ID }} > dist-config.json
+          ETAG=$(jq -r '.ETag' dist-config.json)
+          
+          jq --arg path "/$TARGET" '.DistributionConfig.DefaultCacheBehavior.OriginPath = $path' dist-config.json > modified-config.json
+          jq '.DistributionConfig' modified-config.json > final-config.json
+
+          aws cloudfront update-distribution \
+            --id ${{ env.CF_DIST_ID }} \
+            --distribution-config file://final-config.json \
+            --if-match $ETAG
+
+      # 7. Finalización
+      - name: Finalize Deployment
+        if: success()
+        env:
+          TARGET: ${{ steps.target_env.outputs.TARGET_ENV }}
+        run: |
+          aws cloudfront create-invalidation --distribution-id ${{ env.CF_DIST_ID }} --paths "/*"
+          
+          aws ssm put-parameter \
+            --name "${{ env.SSM_PARAM_NAME }}" \
+            --value "$TARGET" \
+            --type String \
+            --overwrite
+
+      # 8. Resumen
+      - name: Job Summary
+        if: always()
+        run: |
+          echo "## 🚀 Release Status: ${{ env.RELEASE_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" == "success" ]; then
+             echo "✅ **Deployed Successfully!**" >> $GITHUB_STEP_SUMMARY
+             echo "- Active Environment: **/${{ steps.target_env.outputs.TARGET_ENV }}**" >> $GITHUB_STEP_SUMMARY
+             echo "- Version: **${{ env.RELEASE_VERSION }}**" >> $GITHUB_STEP_SUMMARY
+          else
+             echo "❌ **Failed.**" >> $GITHUB_STEP_SUMMARY
+             echo "Traffic remains on **/${{ steps.target_env.outputs.CURRENT_ENV }}**" >> $GITHUB_STEP_SUMMARY
+          fi

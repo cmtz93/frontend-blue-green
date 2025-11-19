@@ -1,0 +1,108 @@
+name: 'Terraform Infrastructure Deploy'
+
+on:
+  # 1. Se activa al hacer push a main SI hay cambios en /iac
+  push:
+    branches: [ "main" ]
+    paths: [ "iac/**" ]
+  
+  # 2. Se activa al abrir un PR SI toca archivos en /iac
+  pull_request:
+    branches: [ "main" ]
+    paths: [ "iac/**" ]
+
+permissions:
+  id-token: write   # Requerido para AWS OIDC
+  contents: read    # Para leer el código
+  pull-requests: write # Para comentar el Plan en el PR (opcional)
+
+env:
+  AWS_REGION: us-east-1
+  TF_WORKING_DIR: './iac' # carpeta de iac
+  IAM_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }} # Output de tu terraform anterior
+
+jobs:
+  terraform:
+    name: 'Terraform'
+    runs-on: ubuntu-latest
+    
+    # Establece el directorio de trabajo por defecto para todos los pasos 'run'
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+    steps:
+      # --- Setup ---
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0" # Usa la versión que prefieras
+
+      # --- Checks de Calidad ---
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -check
+
+      - name: Terraform Init
+        id: init
+        run: terraform init
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      # --- Planificación (Se ejecuta en PR y en Push) ---
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -input=false
+        continue-on-error: true # No fallar el job si hay cambios, queremos ver el plan
+
+      # --- Feedback en el PR (Opcional pero recomendado) ---
+      - name: Update PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      # --- Detener si el Plan falló ---
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      # --- Despliegue (SOLO en Push a Main) ---
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve -input=false

@@ -1,0 +1,106 @@
+name: ⚡ Fast Rollback from Archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      rollback_tag:
+        description: 'Tag de la Release a restaurar (ej: v1.0.0)'
+        required: true
+      reason:
+        description: 'Razón del Rollback'
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: ${{ secrets.S3_BUCKET_NAME }}
+  CF_DIST_ID: ${{ secrets.CF_DISTRIBUTION_ID }}
+  SSM_PARAM_NAME: ${{ secrets.SSM_PARAMETER_NAME }}
+  IAM_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+jobs:
+  rollback-from-s3:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. No necesitamos hacer checkout del código completo, solo credenciales
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 2. Determinar Target (Blue o Green)
+      - name: Determine Target Environment
+        id: rb_target
+        run: |
+          CURRENT_ACTIVE=$(aws ssm get-parameter --name "${{ env.SSM_PARAM_NAME }}" --query "Parameter.Value" --output text || echo "blue")
+          
+          # Si el activo es Blue, restauramos en Green (y viceversa) para preparar el swap
+          if [ "$CURRENT_ACTIVE" == "blue" ]; then
+            echo "TARGET_ENV=green" >> $GITHUB_OUTPUT
+          else
+            echo "TARGET_ENV=blue" >> $GITHUB_OUTPUT
+          fi
+          echo "🚨 Active: $CURRENT_ACTIVE. Restoring archive to -> TARGET: (se define abajo)"
+
+      # 3. COPIA RÁPIDA (S3 a S3) - El paso clave
+      - name: Restore Artifact from Archive
+        env:
+          TARGET: ${{ steps.rb_target.outputs.TARGET_ENV }}
+          TAG: ${{ github.event.inputs.rollback_tag }}
+        run: |
+          echo "Restaurando desde s3://${{ env.S3_BUCKET }}/releases/$TAG/ hacia s3://${{ env.S3_BUCKET }}/$TARGET/"
+          
+          # Verificar que el archivo existe antes de intentar copiar
+          if ! aws s3 ls "s3://${{ env.S3_BUCKET }}/releases/$TAG/" > /dev/null 2>&1; then
+            echo "❌ Error: No existe un archivo para la release $TAG en S3."
+            exit 1
+          fi
+
+          # Copia server-side (muy rápida)
+          aws s3 sync s3://${{ env.S3_BUCKET }}/releases/$TAG/ s3://${{ env.S3_BUCKET }}/$TARGET/ --delete
+          
+          echo "✅ Restauración completada."
+
+      # 4. Conmutación de Tráfico (Igual que antes)
+      - name: Execute CloudFront Swap
+        env:
+          TARGET: ${{ steps.rb_target.outputs.TARGET_ENV }}
+        run: |
+          aws cloudfront get-distribution-config --id ${{ env.CF_DIST_ID }} > dist-config.json
+          ETAG=$(jq -r '.ETag' dist-config.json)
+          
+          jq --arg path "/$TARGET" '.DistributionConfig.DefaultCacheBehavior.OriginPath = $path' dist-config.json > modified-config.json
+          jq '.DistributionConfig' modified-config.json > final-config.json
+
+          aws cloudfront update-distribution \
+            --id ${{ env.CF_DIST_ID }} \
+            --distribution-config file://final-config.json \
+            --if-match $ETAG
+
+      # 5. Invalidación y Estado
+      - name: Finalize Rollback
+        env:
+          TARGET: ${{ steps.rb_target.outputs.TARGET_ENV }}
+          TAG: ${{ github.event.inputs.rollback_tag }}
+        run: |
+          aws cloudfront create-invalidation --distribution-id ${{ env.CF_DIST_ID }} --paths "/*"
+          
+          aws ssm put-parameter \
+            --name "${{ env.SSM_PARAM_NAME }}" \
+            --value "$TARGET" \
+            --type String \
+            --overwrite
+
+      - name: Notify
+        if: always()
+        run: |
+          echo "## ⚡ Fast Rollback Completed" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" == "success" ]; then
+             echo "✅ Versión **${{ github.event.inputs.rollback_tag }}** restaurada desde archivo S3." >> $GITHUB_STEP_SUMMARY
+          else
+             echo "❌ Falló la restauración." >> $GITHUB_STEP_SUMMARY
+          fi
